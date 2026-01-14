@@ -1,0 +1,183 @@
+import torch
+import torch.nn.functional as F
+from torch import nn
+from models.restormer import TransformerBlock as Restormer
+
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from models.restormer import TransformerBlock as Restormer
+
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(CrossAttention, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+
+    def forward(self, query, key, value):
+        query = query.transpose(0, 1)
+        key = key.transpose(0, 1)
+        value = value.transpose(0, 1)
+
+        attn_output, _ = self.multihead_attn(query, key, value)
+        attn_output = attn_output.transpose(0, 1)
+
+        return attn_output
+
+
+class imagefeature2textfeature(nn.Module):
+    def __init__(self, in_channel, mid_channel, hidden_dim):
+        super(imagefeature2textfeature, self).__init__()
+        self.conv = nn.Conv2d(in_channels=in_channel, out_channels=mid_channel, kernel_size=1)
+        self.hidden_dim = hidden_dim
+        self.linear = nn.Linear(4096, 768)
+    def forward(self, x):
+        x = self.conv(x)
+
+        x = F.interpolate(x, [64, 64], mode='nearest')
+        x = x.view(x.size(0), x.size(1), -1)
+        x = self.linear(x)
+        x = x.contiguous().view(x.size(0), -1, self.hidden_dim)
+        return x
+
+
+class restormer_cablock(nn.Module):
+    def __init__(
+            self,
+            ms_input_channel=8,
+            pan_input_channel=1,
+            restormerdim=32,
+            restormerhead=8,
+            image2text_dim=10,
+            ffn_expansion_factor=4,
+            bias=False,
+            LayerNorm_type='WithBias',
+            hidden_dim=768,
+            pooling='avg',
+            normalization='l1'
+    ):
+        super().__init__()
+        self.convA1 = nn.Conv2d(ms_input_channel, restormerdim, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.preluA1 = nn.PReLU()
+        self.convA2 = nn.Conv2d(image2text_dim, restormerdim, kernel_size=1)
+        self.preluA2 = nn.PReLU()
+        self.convA3 = nn.Conv2d(2 * restormerdim, restormerdim, kernel_size=1)
+        self.preluA3 = nn.PReLU()
+
+        self.convB1 = nn.Conv2d(pan_input_channel, restormerdim, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.preluB1 = nn.PReLU()
+        self.convB2 = nn.Conv2d(image2text_dim, restormerdim, kernel_size=1)
+        self.preluB2 = nn.PReLU()
+        self.convB3 = nn.Conv2d(2 * restormerdim, restormerdim, kernel_size=1)
+        self.preluB3 = nn.PReLU()
+
+        self.image2text_dim = image2text_dim
+        self.restormerA1 = Restormer(restormerdim, restormerhead, ffn_expansion_factor, bias, LayerNorm_type)
+        self.restormerB1 = Restormer(restormerdim, restormerhead, ffn_expansion_factor, bias, LayerNorm_type)
+        self.cross_attentionA1 = CrossAttention(embed_dim=hidden_dim, num_heads=8)
+        self.cross_attentionA2 = CrossAttention(embed_dim=hidden_dim, num_heads=8)
+        self.imagef2textfA1 = imagefeature2textfeature(restormerdim, image2text_dim, hidden_dim)
+        self.imagef2textfB1 = imagefeature2textfeature(restormerdim, image2text_dim, hidden_dim)
+        self.image2text_dim = image2text_dim
+        self.linear = nn.Linear(768, 4096)
+
+
+    def forward(self, imageA, imageB, text):
+        if len(imageA.shape) == 3:
+            imageA = imageA.cuda().unsqueeze(0).permute(0, 3, 1, 2)
+            imageB = imageB.cuda().unsqueeze(0).permute(0, 3, 1, 2)
+        b, _, H, W = imageB.shape
+
+        imageA = self.restormerA1(self.preluA1(self.convA1(imageA)))
+        imageAtotext = self.imagef2textfA1(imageA)
+        imageB = self.restormerB1(self.preluB1(self.convB1(imageB)))
+        imageBtotext = self.imagef2textfB1(imageB)
+
+        ca_A = self.cross_attentionA1(text, imageAtotext, imageAtotext)
+        imageA_sideout = imageA
+        ca_A = torch.nn.functional.adaptive_avg_pool1d(ca_A.permute(0, 2, 1), 1).permute(0, 2, 1)
+        ca_A = F.normalize(ca_A, p=1, dim=2)
+
+        ca_A = self.linear(imageAtotext * ca_A).view(imageA.shape[0], self.image2text_dim, 64, 64)
+        imageA_sideout = F.interpolate(imageA_sideout, [H, W], mode='nearest')
+        ca_A = F.interpolate(ca_A, [H, W], mode='nearest')
+        ca_A = self.preluA3(
+            self.convA3(torch.cat(
+                (F.interpolate(imageA, [H, W], mode='nearest'), self.preluA2(self.convA2(ca_A)) + imageA_sideout), 1)))
+
+        ca_B = self.cross_attentionA2(text, imageBtotext, imageBtotext)
+        imageB_sideout = imageB
+        ca_B = torch.nn.functional.adaptive_avg_pool1d(ca_B.permute(0, 2, 1), 1).permute(0, 2, 1)
+        ca_B = F.normalize(ca_B, p=1, dim=2)
+
+        ca_B = self.linear(imageBtotext * ca_B).view(imageA.shape[0], self.image2text_dim, 64, 64)
+        imageB_sideout = F.interpolate(imageB_sideout, [H, W], mode='nearest')
+        ca_B = F.interpolate(ca_B, [H, W], mode='nearest')
+        ca_B = self.preluB3(
+            self.convB3(torch.cat(
+                (F.interpolate(imageB, [H, W], mode='nearest'), self.preluB2(self.convB2(ca_B)) + imageB_sideout), 1)))
+
+        return ca_A, ca_B
+
+
+
+class Net(nn.Module):
+    def __init__(
+            self,
+            mid_channel=32,
+            decoder_num_heads=8,
+            ffn_factor=4,
+            bias=False,
+            LayerNorm_type='WithBias',
+            out_channel=8,
+            hidden_dim=768,
+            image2text_dim=32,
+            pooling='avg',
+            normalization='l1'
+    ):
+        super().__init__()
+
+        self.restormerca1 = restormer_cablock(ms_input_channel=8, pan_input_channel=1, image2text_dim=image2text_dim)
+        self.restormerca2 = restormer_cablock(ms_input_channel=mid_channel, pan_input_channel=32, hidden_dim=hidden_dim,
+                                              image2text_dim=image2text_dim)
+        # self.restormerca3 = restormer_cablock(input_channel=mid_channel, hidden_dim=hidden_dim,
+        #                                       image2text_dim=image2text_dim)
+        self.restormer1 = Restormer(2 * mid_channel, decoder_num_heads, ffn_factor, bias, LayerNorm_type)
+        self.restormer2 = Restormer(mid_channel, decoder_num_heads, ffn_factor, bias, LayerNorm_type)
+        self.restormer3 = Restormer(mid_channel, decoder_num_heads, ffn_factor, bias, LayerNorm_type)
+        self.conv1 = nn.Conv2d(2 * mid_channel, mid_channel, kernel_size=1)
+        self.conv2 = nn.Conv2d(mid_channel, out_channel, kernel_size=1)
+        self.softmax = nn.Sigmoid()
+
+    def forward(self, feature_ms, feature_pan, text):
+
+        featureA, featureB = self.restormerca1(feature_ms, feature_pan, text)
+        featureA, featureB = self.restormerca2(featureA, featureB, text)
+        fusionfeature = torch.cat((featureA, featureB), 1)
+        fusionfeature = self.restormer1(fusionfeature)
+        fusionfeature = self.conv1(fusionfeature)
+        fusionfeature = self.restormer2(fusionfeature)
+        fusionfeature = self.restormer3(fusionfeature)
+        fusionfeature = self.conv2(fusionfeature)
+        fusionfeature = self.softmax(fusionfeature)
+        return fusionfeature
+
+
+
+if __name__ == '__main__':
+    xms = torch.randn(1, 8, 16, 16)
+    pan = torch.randn(1, 1, 64, 64)
+    text = torch.randn(1, 17, 768)
+    Model = Net()
+    # summary(Model, input_size=[(pan.shape),(xms.shape)], device='cpu')
+    x = Model(xms, pan, text)
+    # print(x.shape)
+    # for nam, param in Model.named_modules():
+    #     print(f"Layer:{nam} | Size:{param.size()}")
+    total_params = sum(p.numel() for p in Model.parameters())
+    trainable_params = sum(p.numel() for p in Model.parameters() if p.requires_grad)
+
+    print(f'Total parameters: {total_params}')
+    print(f'Trainable parameters: {trainable_params}')
